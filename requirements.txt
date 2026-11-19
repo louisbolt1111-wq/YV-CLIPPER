@@ -3,3 +3,4 @@ google-genai
 yt-dlp
 youtube-transcript-api
 moviepy<2.0.0
+requests
