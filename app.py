@@ -80,7 +80,7 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
             if is_video_file:
                 uploaded_file = client.files.upload(file=content_source)
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=[uploaded_file, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -89,7 +89,7 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
                 )
             else:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=f"{prompt}\n\nTRANSCRIPT:\n{content_source}",
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
