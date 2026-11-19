@@ -1,6 +1,6 @@
 streamlit
 google-genai
-yt-dlp>=2026.1.1
+yt-dlp
 youtube-transcript-api
 moviepy<2.0.0
 requests
