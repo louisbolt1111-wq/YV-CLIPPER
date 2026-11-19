@@ -29,8 +29,9 @@ class ClipList(BaseModel):
 def extract_video_id(url: str):
     parsed = urlparse(url)
     if parsed.hostname in ('youtu.be', 'www.youtu.be'):
-        return parsed.path[1:]
-    if parsed.hostname in ('youtube.com', 'youtube.com', 'youtube.com'):
+        path_parts = parsed.path.lstrip('/').split('/')
+        return path_parts[0] if path_parts and path_parts[0] else None
+    if parsed.hostname in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
         if parsed.path == '/watch':
             return parse_qs(parsed.query).get('v', [None])[0]
         if parsed.path.startswith(('/embed/', '/v/', '/shorts/')):
@@ -39,11 +40,19 @@ def extract_video_id(url: str):
     return None
 
 def get_youtube_transcript(video_id: str) -> str:
-    transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+    # Works with both youtube-transcript-api v1.0+ and older v0.6.x versions
+    if hasattr(YouTubeTranscriptApi, 'get_transcript'):
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+    else:
+        ytt_api = YouTubeTranscriptApi()
+        fetched = ytt_api.fetch(video_id)
+        transcript_list = fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else list(fetched)
+
     formatted = []
     for entry in transcript_list:
-        start = round(entry['start'], 1)
-        text = entry['text'].replace('\n', ' ')
+        start = round(entry['start'] if isinstance(entry, dict) else entry.start, 1)
+        raw_text = entry['text'] if isinstance(entry, dict) else entry.text
+        text = raw_text.replace('\n', ' ')
         formatted.append(f"[{start}s] {text}")
     return "\n".join(formatted)
 
@@ -63,7 +72,7 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
         "Each clip MUST be between 20 and 55 seconds long. Look for strong hooks, surprising facts, emotional stories, or actionable advice. "
         "Return exact start_seconds and end_seconds."
     )
-
+    
     last_error = None
     for index, key in enumerate(api_keys):
         try:
@@ -87,10 +96,10 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
                         response_schema=ClipList,
                     ),
                 )
-
+            
             data = json.loads(response.text)
             return [ViralClip(**item) for item in data.get("clips", [])]
-
+            
         except Exception as e:
             last_error = e
             error_msg = str(e).lower()
@@ -99,7 +108,7 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
                 continue
             else:
                 raise e
-
+                
     raise RuntimeError(f"All provided Gemini API keys hit their quota or failed. Last error: {last_error}")
 
 def cut_and_format_clip(video_path: str, start: float, end: float, output_path: str, make_vertical: bool):
@@ -107,9 +116,9 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
         max_duration = video.duration
         start = max(0, min(start, max_duration - 5))
         end = min(end, max_duration)
-
+        
         subclip = video.subclip(start, end)
-
+        
         if make_vertical:
             w, h = subclip.size
             target_ratio = 9 / 16
@@ -117,7 +126,7 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
             if new_w < w:
                 x_center = w / 2
                 subclip = subclip.crop(x1=x_center - new_w / 2, x2=x_center + new_w / 2)
-
+        
         subclip.write_videofile(
             output_path,
             codec="libx264",
@@ -131,16 +140,16 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
 with st.sidebar:
     st.header("🔑 Flexible Gemini API Keys")
     st.caption("Paste one key, or multiple keys (one per line). You can change or replace them anytime without redeploying.")
-
+    
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     raw_keys_input = st.text_area(
         "Enter Gemini API Key(s)",
         value=default_key,
         height=110,
         placeholder="AIzaSyYourFirstKey...\nAIzaSyYourBackupKey...",
-        help="Get free keys from Google AI Studio. Add multiple keys on separate lines for automatic failover."
+        help="Get free keys from Google AI Studio (aistudio.google.com). Keys start with AIzaSy."
     )
-
+    
     api_keys = [k.strip() for k in raw_keys_input.splitlines() if k.strip()]
     if api_keys:
         st.success(f"✅ {len(api_keys)} API key(s) loaded and ready.")
@@ -156,7 +165,7 @@ with st.sidebar:
 tab1, tab2 = st.tabs(["🔗 Paste YouTube Link", "📁 Upload Video File (Backup)"])
 
 with tab1:
-    yt_url = st.text_input("YouTube Video URL", placeholder="https://youtube.com...")
+    yt_url = st.text_input("YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
     run_yt = st.button("✨ Generate Viral Clips from Link", type="primary", use_container_width=True)
 
 with tab2:
@@ -171,13 +180,13 @@ if run_yt or run_upload:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_video_path = os.path.join(tmpdir, "source.mp4")
-
+        
         try:
             if run_yt:
                 if not yt_url:
                     st.warning("Please paste a valid YouTube link.")
                     st.stop()
-
+                
                 video_id = extract_video_id(yt_url)
                 if not video_id:
                     st.error("Could not extract a valid YouTube Video ID from that URL.")
@@ -198,7 +207,7 @@ if run_yt or run_upload:
                 if not uploaded_video:
                     st.warning("Please upload a video file first.")
                     st.stop()
-
+                
                 with open(raw_video_path, "wb") as f:
                     f.write(uploaded_video.read())
 
@@ -215,11 +224,11 @@ if run_yt or run_upload:
                 with st.container(border=True):
                     st.markdown(f"### #{idx}: {clip.title}")
                     st.caption(f"⏱️ Timestamp: `{clip.start_seconds}s` → `{clip.end_seconds}s` | 💡 **Why it works:** {clip.reason}")
-
+                    
                     out_file = os.path.join(tmpdir, f"short_{idx}.mp4")
                     with st.spinner(f"Rendering clip #{idx}..."):
                         cut_and_format_clip(raw_video_path, clip.start_seconds, clip.end_seconds, out_file, make_vertical)
-
+                    
                     with open(out_file, "rb") as video_file:
                         video_bytes = video_file.read()
                         st.video(video_bytes)
