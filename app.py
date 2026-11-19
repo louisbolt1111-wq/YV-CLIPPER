@@ -2,8 +2,8 @@ import streamlit as st
 import os
 import json
 import time
+import glob
 import tempfile
-import http.cookiejar
 import requests
 from urllib.parse import urlparse, parse_qs
 from google import genai
@@ -41,13 +41,49 @@ def extract_video_id(url: str):
             return parts[2] if len(parts) > 2 else None
     return None
 
-def get_youtube_transcript_with_fallback(video_id: str, url: str, cookie_path: str = None, proxy_url: str = None) -> str:
-    # Method 1: Try youtube-transcript-api first
+def parse_vtt_to_transcript(vtt_path: str) -> str:
+    lines = []
+    seen = set()
+    current_time = "0.0s"
+    with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if "-->" in line:
+                start_str = line.split("-->")[0].strip()
+                parts = start_str.split(":")
+                try:
+                    if len(parts) == 3:
+                        secs = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                    elif len(parts) == 2:
+                        secs = float(parts[0]) * 60 + float(parts[1])
+                    else:
+                        secs = float(parts[0])
+                    current_time = f"{round(secs, 1)}s"
+                except ValueError:
+                    pass
+            elif line and not line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")) and not line.isdigit():
+                clean_text = line.replace("<c>", "").replace("</c>", "")
+                while "<" in clean_text and ">" in clean_text:
+                    s = clean_text.find("<")
+                    e = clean_text.find(">", s)
+                    if e != -1:
+                        clean_text = clean_text[:s] + clean_text[e+1:]
+                    else:
+                        break
+                clean_text = clean_text.strip()
+                if clean_text and clean_text not in seen:
+                    seen.add(clean_text)
+                    lines.append(f"[{current_time}] {clean_text}")
+    return "\n".join(lines)
+
+def get_youtube_transcript_with_fallback(video_id: str, url: str, tmpdir: str, cookie_path: str = None, proxy_url: str = None) -> str:
+    # Method 1: youtube-transcript-api
     try:
         session = requests.Session()
         if proxy_url:
             session.proxies = {"http": proxy_url, "https": proxy_url}
-        if cookie_path and os.path.exists(cookie_path):
+        if cookie_path:
+            import http.cookiejar
             cj = http.cookiejar.MozillaCookieJar(cookie_path)
             cj.load(ignore_discard=True, ignore_expires=True)
             session.cookies = cj
@@ -56,7 +92,10 @@ def get_youtube_transcript_with_fallback(video_id: str, url: str, cookie_path: s
             proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies, cookies=cookie_path)
         else:
-            ytt_api = YouTubeTranscriptApi(http_client=session)
+            try:
+                ytt_api = YouTubeTranscriptApi(http_client=session)
+            except TypeError:
+                ytt_api = YouTubeTranscriptApi()
             fetched = ytt_api.fetch(video_id)
             transcript_list = fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else list(fetched)
 
@@ -71,56 +110,87 @@ def get_youtube_transcript_with_fallback(video_id: str, url: str, cookie_path: s
     except Exception:
         pass
 
-    # Method 2: Fallback to yt-dlp subtitle extraction (much better with cookies.txt)
-    with tempfile.TemporaryDirectory() as sub_dir:
-        ydl_opts = {
+    # Method 2: yt-dlp subtitle extraction
+    try:
+        sub_opts = {
             'skip_download': True,
             'writesubtitles': True,
             'writeautomaticsub': True,
-            'subtitleslangs': ['en', 'en-US', 'en-GB'],
-            'subtitlesformat': 'json3',
-            'outtmpl': os.path.join(sub_dir, '%(id)s.%(ext)s'),
+            'subtitleslangs': ['en', 'en-US', 'en-GB', 'hi'],
+            'subtitlesformat': 'vtt',
+            'outtmpl': os.path.join(tmpdir, 'subs'),
             'quiet': True,
             'no_warnings': True,
         }
-        if cookie_path and os.path.exists(cookie_path):
+        if cookie_path:
+            sub_opts['cookiefile'] = cookie_path
+        if proxy_url:
+            sub_opts['proxy'] = proxy_url
+
+        with yt_dlp.YoutubeDL(sub_opts) as ydl:
+            ydl.download([url])
+
+        vtt_files = glob.glob(os.path.join(tmpdir, "subs*.vtt"))
+        if vtt_files:
+            return parse_vtt_to_transcript(vtt_files[0])
+    except Exception:
+        pass
+
+    return ""
+
+def download_youtube_video(url: str, tmpdir: str, cookie_path: str = None, proxy_url: str = None) -> str:
+    # Try multiple format selectors and player clients to avoid "Requested format is not available"
+    format_strategies = [
+        {
+            'format': 'best[ext=mp4]/best',
+            'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+        },
+        {
+            'format': 'bestvideo+bestaudio/best',
+            'merge_output_format': 'mp4',
+            'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+        },
+        {
+            'format': 'best',
+        }
+    ]
+
+    last_err = None
+    for idx, strategy in enumerate(format_strategies):
+        # Clean up any partial files from previous attempt
+        for f in glob.glob(os.path.join(tmpdir, "source*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+        out_template = os.path.join(tmpdir, "source.%(ext)s")
+        ydl_opts = {
+            'outtmpl': out_template,
+            'quiet': True,
+            'no_warnings': True,
+            **strategy
+        }
+        if cookie_path:
             ydl_opts['cookiefile'] = cookie_path
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-        for fname in os.listdir(sub_dir):
-            if fname.endswith('.json3'):
-                with open(os.path.join(sub_dir, fname), 'r', encoding='utf-8') as f:
-                    sub_data = json.load(f)
-                formatted = []
-                for event in sub_data.get('events', []):
-                    if 'segs' in event:
-                        start_sec = round(event.get('tStartMs', 0) / 1000.0, 1)
-                        text = "".join(seg.get('utf8', '') for seg in event['segs']).replace('\n', ' ').strip()
-                        if text:
-                            formatted.append(f"[{start_sec}s] {text}")
-                if formatted:
-                    return "\n".join(formatted)
+            downloaded_files = [
+                f for f in glob.glob(os.path.join(tmpdir, "source.*"))
+                if not f.endswith((".part", ".ytdl", ".vtt"))
+            ]
+            if downloaded_files:
+                return downloaded_files[0]
+        except Exception as e:
+            last_err = e
+            continue
 
-    return ""
-
-def download_youtube_video(url: str, output_path: str, cookie_path: str = None, proxy_url: str = None):
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
-        'outtmpl': output_path,
-        'quiet': True,
-        'no_warnings': True,
-    }
-    if cookie_path and os.path.exists(cookie_path):
-        ydl_opts['cookiefile'] = cookie_path
-    if proxy_url:
-        ydl_opts['proxy'] = proxy_url
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    raise RuntimeError(f"Failed to download video across all format options. Last error: {last_err}")
 
 def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_file: bool = False) -> list[ViralClip]:
     prompt = (
@@ -137,45 +207,60 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
     ]
     
     last_error = None
-    for index, key in enumerate(api_keys):
+    for key_index, key in enumerate(api_keys):
         client = genai.Client(api_key=key)
         uploaded_file = None
         
         if is_video_file:
+            st.write(f"Uploading video to Gemini (using Key #{key_index + 1})...")
             uploaded_file = client.files.upload(file=content_source)
+            
             while uploaded_file.state.name == "PROCESSING":
                 time.sleep(3)
                 uploaded_file = client.files.get(name=uploaded_file.name)
+                
             if uploaded_file.state.name != "ACTIVE":
                 raise RuntimeError(f"Gemini video processing failed with state: {uploaded_file.state.name}")
 
         for model_name in models_to_try:
             try:
-                contents = [uploaded_file, prompt] if is_video_file else f"{prompt}\n\nTRANSCRIPT:\n{content_source}"
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ClipList,
-                    ),
-                )
+                st.write(f"Analyzing with `{model_name}`...")
+                if is_video_file:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[uploaded_file, prompt],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ClipList,
+                        ),
+                    )
+                else:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=f"{prompt}\n\nTRANSCRIPT:\n{content_source}",
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ClipList,
+                        ),
+                    )
+                
                 data = json.loads(response.text)
                 return [ViralClip(**item) for item in data.get("clips", [])]
                 
             except Exception as e:
                 last_error = e
                 error_msg = str(e).lower()
-                if "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
-                    st.warning(f"Key #{index + 1} hit quota limit. Switching to next key...")
-                    break
-                elif "503" in error_msg or "unavailable" in error_msg or "404" in error_msg or "not_found" in error_msg:
-                    st.info(f"Model `{model_name}` busy/unavailable. Trying backup model...")
+                if "503" in error_msg or "unavailable" in error_msg or "overloaded" in error_msg or "404" in error_msg:
+                    st.warning(f"`{model_name}` is temporarily busy/unavailable. Trying next model...")
+                    time.sleep(1)
                     continue
+                elif "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
+                    st.warning(f"Key #{key_index + 1} hit quota limit. Switching to next API key...")
+                    break
                 else:
                     raise e
                 
-    raise RuntimeError(f"All provided Gemini API keys or models failed. Last error: {last_error}")
+    raise RuntimeError(f"All available models and API keys failed. Last error: {last_error}")
 
 def cut_and_format_clip(video_path: str, start: float, end: float, output_path: str, make_vertical: bool):
     with VideoFileClip(video_path) as video:
@@ -205,14 +290,14 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
 # --- Sidebar Settings ---
 with st.sidebar:
     st.header("🔑 Flexible Gemini API Keys")
-    st.caption("Paste one key, or multiple keys (one per line). Change or replace anytime without redeploying.")
+    st.caption("Paste one key, or multiple keys (one per line). You can change or replace them anytime without redeploying.")
     
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     raw_keys_input = st.text_area(
         "Enter Gemini API Key(s)",
         value=default_key,
         height=100,
-        placeholder="AQ.Ab8RN6... or AIzaSy...",
+        placeholder="Paste your Google AI Studio key(s)...",
         help="Get free keys from Google AI Studio (aistudio.google.com)."
     )
     
@@ -224,15 +309,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🍪 YouTube Unblock Settings")
-    st.caption("Upload cookies.txt (from a burner account) and/or enter a proxy URL to bypass Streamlit Cloud IP blocks.")
-    cookie_file = st.file_uploader("Upload cookies.txt (Optional)", type=["txt"])
-    if cookie_file:
+    st.caption("Upload cookies.txt (exported while logged into a burner account) and/or enter a proxy URL.")
+    uploaded_cookies = st.file_uploader("Upload cookies.txt (Optional)", type=["txt"])
+    if uploaded_cookies:
         st.success("✅ Cookies loaded for YouTube requests.")
-
+        
     proxy_url = st.text_input(
         "Proxy URL (Optional)",
         placeholder="http://user:pass@host:port",
-        help="Optional residential proxy if YouTube blocks cloud IPs even with cookies."
+        help="Residential proxy URL if YouTube blocks cloud server IPs."
     )
 
     st.markdown("---")
@@ -257,12 +342,13 @@ if run_yt or run_upload:
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        raw_video_path = os.path.join(tmpdir, "source.mp4")
         cookie_path = None
-        if cookie_file:
+        if uploaded_cookies:
             cookie_path = os.path.join(tmpdir, "cookies.txt")
             with open(cookie_path, "wb") as cf:
-                cf.write(cookie_file.getvalue())
+                cf.write(uploaded_cookies.getvalue())
+
+        clean_proxy = proxy_url.strip() if proxy_url and proxy_url.strip() else None
         
         try:
             if run_yt:
@@ -277,18 +363,21 @@ if run_yt or run_upload:
 
                 with st.status("Step 1/3: Downloading video & transcript...", expanded=True) as status:
                     st.write("Downloading video stream...")
-                    download_youtube_video(yt_url, raw_video_path, cookie_path=cookie_path, proxy_url=proxy_url.strip() or None)
-                    st.write("Extracting transcript...")
+                    raw_video_path = download_youtube_video(yt_url, tmpdir, cookie_path=cookie_path, proxy_url=clean_proxy)
+                    st.write("Fetching transcript...")
                     transcript_text = get_youtube_transcript_with_fallback(
-                        video_id, yt_url, cookie_path=cookie_path, proxy_url=proxy_url.strip() or None
+                        video_id, yt_url, tmpdir, cookie_path=cookie_path, proxy_url=clean_proxy
                     )
+                    if transcript_text:
+                        st.write("Transcript extracted successfully!")
+                    else:
+                        st.write("No text transcript available—will send video directly to Gemini AI.")
                     status.update(label="Download complete!", state="complete")
 
                 with st.status("Step 2/3: AI is hunting for viral moments...", expanded=True) as status:
                     if transcript_text:
                         clips = analyze_with_gemini_rotation(api_keys, transcript_text, is_video_file=False)
                     else:
-                        st.info("No text transcript available — sending downloaded video directly to Gemini AI...")
                         clips = analyze_with_gemini_rotation(api_keys, raw_video_path, is_video_file=True)
                     status.update(label=f"Found {len(clips)} viral segments!", state="complete")
 
@@ -297,6 +386,7 @@ if run_yt or run_upload:
                     st.warning("Please upload a video file first.")
                     st.stop()
                 
+                raw_video_path = os.path.join(tmpdir, "source.mp4")
                 with open(raw_video_path, "wb") as f:
                     f.write(uploaded_video.read())
 
@@ -331,5 +421,5 @@ if run_yt or run_upload:
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
-            if "Sign in to confirm" in str(e) or "403" in str(e) or "blocking requests" in str(e):
-                st.info("💡 Tip: Make sure you exported cookies while logged into YouTube, or add a Proxy URL in the sidebar, or use the **Upload Video File (Backup)** tab!")
+            if "Sign in to confirm" in str(e) or "403" in str(e) or "blocked" in str(e).lower():
+                st.info("💡 YouTube blocked this request. Export cookies while logged into a burner YouTube account, enter a Proxy URL in the sidebar, or use the **Upload Video File (Backup)** tab!")
