@@ -3,6 +3,8 @@ import os
 import json
 import time
 import tempfile
+import requests
+from http.cookiejar import MozillaCookieJar
 from urllib.parse import urlparse, parse_qs
 from google import genai
 from google.genai import types
@@ -39,11 +41,21 @@ def extract_video_id(url: str):
             return parts[2] if len(parts) > 2 else None
     return None
 
-def get_youtube_transcript(video_id: str) -> str:
+def get_youtube_transcript(video_id: str, cookies_path: str = None) -> str:
+    session = None
+    if cookies_path and os.path.exists(cookies_path):
+        session = requests.Session()
+        cj = MozillaCookieJar(cookies_path)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        session.cookies = cj
+
     if hasattr(YouTubeTranscriptApi, 'get_transcript'):
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        if cookies_path:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, cookies=cookies_path)
+        else:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
     else:
-        ytt_api = YouTubeTranscriptApi()
+        ytt_api = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
         fetched = ytt_api.fetch(video_id)
         transcript_list = fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else list(fetched)
 
@@ -55,88 +67,82 @@ def get_youtube_transcript(video_id: str) -> str:
         formatted.append(f"[{start}s] {text}")
     return "\n".join(formatted)
 
-def download_youtube_video(url: str, output_path: str):
+def download_youtube_video(url: str, output_path: str, cookies_path: str = None):
     ydl_opts = {
         'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
     }
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 def wait_for_file_active(client, uploaded_file):
-    while True:
-        file_info = client.files.get(name=uploaded_file.name)
-        state = getattr(file_info.state, 'name', str(file_info.state))
-        if state == "ACTIVE":
-            return file_info
-        if state == "FAILED":
-            raise RuntimeError("Gemini File API failed to process the uploaded video.")
+    while uploaded_file.state.name == "PROCESSING":
         time.sleep(3)
+        uploaded_file = client.files.get(name=uploaded_file.name)
+    if uploaded_file.state.name != "ACTIVE":
+        raise RuntimeError(f"Video processing failed on Gemini servers with state: {uploaded_file.state.name}")
+    return uploaded_file
 
-def analyze_with_gemini_rotation(api_keys: list[str], models_to_try: list[str], content_source, is_video_file: bool = False) -> list[ViralClip]:
+def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_file: bool = False) -> list[ViralClip]:
     prompt = (
         "Analyze this content and find the top 3 most engaging, high-retention, viral segments suitable for YouTube Shorts. "
         "Each clip MUST be between 20 and 55 seconds long. Look for strong hooks, surprising facts, emotional stories, or actionable advice. "
         "Return exact start_seconds and end_seconds."
     )
     
+    fallback_models = [
+        "gemini-3.8-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.0-flash",
+        "gemini-2.5-flash-lite",
+    ]
+    
     last_error = None
-    for key_index, key in enumerate(api_keys):
+    for index, key in enumerate(api_keys):
         client = genai.Client(api_key=key)
         uploaded_file = None
         
         if is_video_file:
             try:
-                st.write(f"Uploading video to Gemini servers (Key #{key_index + 1})...")
                 uploaded_file = client.files.upload(file=content_source)
-                st.write("Waiting for Gemini to finish indexing the video...")
                 uploaded_file = wait_for_file_active(client, uploaded_file)
-            except Exception as upload_err:
-                last_error = upload_err
-                st.warning(f"Upload failed on Key #{key_index + 1}: {upload_err}")
+            except Exception as e:
+                last_error = e
                 continue
 
-        for model_name in models_to_try:
+        for model_name in fallback_models:
             try:
-                st.write(f"Analyzing with **{model_name}**...")
-                if is_video_file:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[uploaded_file, prompt],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=ClipList,
-                        ),
-                    )
-                else:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=f"{prompt}\n\nTRANSCRIPT:\n{content_source}",
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=ClipList,
-                        ),
-                    )
-                
+                contents_payload = [uploaded_file, prompt] if is_video_file else f"{prompt}\n\nTRANSCRIPT:\n{content_source}"
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents_payload,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ClipList,
+                    ),
+                )
                 data = json.loads(response.text)
+                st.caption(f"✨ Analyzed successfully using `{model_name}`")
                 return [ViralClip(**item) for item in data.get("clips", [])]
                 
             except Exception as e:
                 last_error = e
                 error_msg = str(e).lower()
-                if "503" in error_msg or "unavailable" in error_msg or "overloaded" in error_msg or "404" in error_msg or "not_found" in error_msg:
-                    st.warning(f"⚠️ `{model_name}` is busy or unavailable. Switching to next backup model...")
-                    time.sleep(1)
+                if "503" in error_msg or "unavailable" in error_msg or "high demand" in error_msg or "404" in error_msg:
+                    st.warning(f"Model `{model_name}` is busy or unavailable. Switching to backup model...")
                     continue
                 elif "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
-                    st.warning(f"⚠️ Key #{key_index + 1} hit quota limit. Switching to next API key...")
+                    st.warning(f"Key #{index + 1} hit quota limit. Switching to next API key...")
                     break
                 else:
                     raise e
-                    
-    raise RuntimeError(f"All models and keys were busy or hit limits. Last error: {last_error}")
+                
+    raise RuntimeError(f"All models and API keys failed or hit temporary demand spikes. Last error: {last_error}")
 
 def cut_and_format_clip(video_path: str, start: float, end: float, output_path: str, make_vertical: bool):
     with VideoFileClip(video_path) as video:
@@ -163,50 +169,47 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
             logger=None
         )
 
-# --- Sidebar Settings (Variable API Keys & Models) ---
+# --- Sidebar Settings ---
 with st.sidebar:
     st.header("🔑 Flexible Gemini API Keys")
-    st.caption("Paste one key, or multiple keys (one per line). You can change or replace them anytime without redeploying.")
+    st.caption("Paste one key, or multiple keys (one per line). Change or replace them anytime without redeploying.")
     
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     raw_keys_input = st.text_area(
         "Enter Gemini API Key(s)",
         value=default_key,
         height=100,
-        placeholder="AQ.YourFirstKey...\nAQ.YourBackupKey...",
+        placeholder="AQ.Ab8RN6... or AIzaSy...",
         help="Get free keys from Google AI Studio. Add multiple keys on separate lines for automatic failover."
     )
     
     api_keys = [k.strip() for k in raw_keys_input.splitlines() if k.strip()]
     if api_keys:
-        st.success(f"✅ {len(api_keys)} API key(s) loaded and ready.")
+        st.success(f"✅ {len(api_keys)} API key(s) loaded.")
     else:
         st.warning("⚠️ No API key entered yet.")
 
     st.markdown("---")
-    st.header("🤖 AI Model Fallback Order")
-    models_input = st.text_input(
-        "Models to try (comma-separated)",
-        value="gemini-3.8-flash-lite, gemini-3.8-flash, gemini-3.0-flash, gemini-2.5-flash-lite",
-        help="If the first model has a 503 high-demand spike, the app automatically tries the next one."
-    )
-    models_to_try = [m.strip() for m in models_input.split(",") if m.strip()]
+    st.header("🍪 YouTube Cookies (Unblock Links)")
+    st.caption("Upload a Netscape `cookies.txt` file from a secondary/burner YouTube account to bypass Streamlit Cloud IP blocks.")
+    cookies_file = st.file_uploader("Upload cookies.txt (Optional)", type=["txt"])
+    if cookies_file:
+        st.success("✅ Cookies loaded for YouTube requests.")
 
     st.markdown("---")
     st.header("🎬 Video Settings")
     make_vertical = st.toggle("Crop to 9:16 Vertical (Shorts)", value=True)
-    st.caption("Tip: If YouTube blocks cloud downloads, switch to the 'Upload Video File' tab.")
 
 # --- Main Interface ---
-tab1, tab2 = st.tabs(["📁 Upload Video File (Recommended)", "🔗 Paste YouTube Link"])
+tab1, tab2 = st.tabs(["🔗 Paste YouTube Link", "📁 Upload Video File (Backup)"])
 
 with tab1:
-    uploaded_video = st.file_uploader("Upload an MP4 video", type=["mp4", "mov", "mkv"])
-    run_upload = st.button("✨ Generate Viral Clips from File", type="primary", use_container_width=True)
-
-with tab2:
     yt_url = st.text_input("YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
     run_yt = st.button("✨ Generate Viral Clips from Link", type="primary", use_container_width=True)
+
+with tab2:
+    uploaded_video = st.file_uploader("Upload an MP4 video", type=["mp4", "mov", "mkv"])
+    run_upload = st.button("✨ Generate Viral Clips from File", type="primary", use_container_width=True)
 
 # --- Processing Logic ---
 if run_yt or run_upload:
@@ -216,6 +219,12 @@ if run_yt or run_upload:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_video_path = os.path.join(tmpdir, "source.mp4")
+        cookies_path = None
+        
+        if cookies_file:
+            cookies_path = os.path.join(tmpdir, "cookies.txt")
+            with open(cookies_path, "wb") as cf:
+                cf.write(cookies_file.read())
         
         try:
             if run_yt:
@@ -230,13 +239,13 @@ if run_yt or run_upload:
 
                 with st.status("Step 1/3: Fetching transcript & downloading video...", expanded=True) as status:
                     st.write("Downloading transcript...")
-                    transcript_text = get_youtube_transcript(video_id)
+                    transcript_text = get_youtube_transcript(video_id, cookies_path)
                     st.write("Downloading video stream...")
-                    download_youtube_video(yt_url, raw_video_path)
+                    download_youtube_video(yt_url, raw_video_path, cookies_path)
                     status.update(label="Download complete!", state="complete")
 
                 with st.status("Step 2/3: AI is hunting for viral moments...", expanded=True) as status:
-                    clips = analyze_with_gemini_rotation(api_keys, models_to_try, transcript_text, is_video_file=False)
+                    clips = analyze_with_gemini_rotation(api_keys, transcript_text, is_video_file=False)
                     status.update(label=f"Found {len(clips)} viral segments!", state="complete")
 
             elif run_upload:
@@ -247,8 +256,8 @@ if run_yt or run_upload:
                 with open(raw_video_path, "wb") as f:
                     f.write(uploaded_video.read())
 
-                with st.status("Step 1/2: Uploading & analyzing video with Gemini AI...", expanded=True) as status:
-                    clips = analyze_with_gemini_rotation(api_keys, models_to_try, raw_video_path, is_video_file=True)
+                with st.status("Step 1/2: Uploading & processing video on Gemini AI...", expanded=True) as status:
+                    clips = analyze_with_gemini_rotation(api_keys, raw_video_path, is_video_file=True)
                     status.update(label=f"Found {len(clips)} viral segments!", state="complete")
 
             if not clips:
@@ -278,5 +287,5 @@ if run_yt or run_upload:
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
-            if "Sign in to confirm" in str(e) or "403" in str(e) or "blocking requests" in str(e).lower():
-                st.info("💡 YouTube blocked the cloud server IP. Use the **Upload Video File (Recommended)** tab instead!")
+            if "Sign in to confirm" in str(e) or "403" in str(e) or "blocking requests" in str(e):
+                st.info("💡 YouTube blocked this request. Upload a fresh `cookies.txt` file in the sidebar, or use the **Upload Video File (Backup)** tab!")
