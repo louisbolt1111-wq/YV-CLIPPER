@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import json
+import time
 import tempfile
 from urllib.parse import urlparse, parse_qs
 from google import genai
@@ -29,8 +30,7 @@ class ClipList(BaseModel):
 def extract_video_id(url: str):
     parsed = urlparse(url)
     if parsed.hostname in ('youtu.be', 'www.youtu.be'):
-        path_parts = parsed.path.lstrip('/').split('/')
-        return path_parts[0] if path_parts and path_parts[0] else None
+        return parsed.path.lstrip('/').split('/')[0]
     if parsed.hostname in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
         if parsed.path == '/watch':
             return parse_qs(parsed.query).get('v', [None])[0]
@@ -40,7 +40,6 @@ def extract_video_id(url: str):
     return None
 
 def get_youtube_transcript(video_id: str) -> str:
-    # Works with both youtube-transcript-api v1.0+ and older v0.6.x versions
     if hasattr(YouTubeTranscriptApi, 'get_transcript'):
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
     else:
@@ -66,7 +65,17 @@ def download_youtube_video(url: str, output_path: str):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_file: bool = False) -> list[ViralClip]:
+def wait_for_file_active(client, uploaded_file):
+    while True:
+        file_info = client.files.get(name=uploaded_file.name)
+        state = getattr(file_info.state, 'name', str(file_info.state))
+        if state == "ACTIVE":
+            return file_info
+        if state == "FAILED":
+            raise RuntimeError("Gemini File API failed to process the uploaded video.")
+        time.sleep(3)
+
+def analyze_with_gemini_rotation(api_keys: list[str], models_to_try: list[str], content_source, is_video_file: bool = False) -> list[ViralClip]:
     prompt = (
         "Analyze this content and find the top 3 most engaging, high-retention, viral segments suitable for YouTube Shorts. "
         "Each clip MUST be between 20 and 55 seconds long. Look for strong hooks, surprising facts, emotional stories, or actionable advice. "
@@ -74,42 +83,60 @@ def analyze_with_gemini_rotation(api_keys: list[str], content_source, is_video_f
     )
     
     last_error = None
-    for index, key in enumerate(api_keys):
-        try:
-            client = genai.Client(api_key=key)
-            if is_video_file:
+    for key_index, key in enumerate(api_keys):
+        client = genai.Client(api_key=key)
+        uploaded_file = None
+        
+        if is_video_file:
+            try:
+                st.write(f"Uploading video to Gemini servers (Key #{key_index + 1})...")
                 uploaded_file = client.files.upload(file=content_source)
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=[uploaded_file, prompt],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ClipList,
-                    ),
-                )
-            else:
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=f"{prompt}\n\nTRANSCRIPT:\n{content_source}",
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ClipList,
-                    ),
-                )
-            
-            data = json.loads(response.text)
-            return [ViralClip(**item) for item in data.get("clips", [])]
-            
-        except Exception as e:
-            last_error = e
-            error_msg = str(e).lower()
-            if "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
-                st.warning(f"Key #{index + 1} hit quota limit. Automatically switching to next key...")
+                st.write("Waiting for Gemini to finish indexing the video...")
+                uploaded_file = wait_for_file_active(client, uploaded_file)
+            except Exception as upload_err:
+                last_error = upload_err
+                st.warning(f"Upload failed on Key #{key_index + 1}: {upload_err}")
                 continue
-            else:
-                raise e
+
+        for model_name in models_to_try:
+            try:
+                st.write(f"Analyzing with **{model_name}**...")
+                if is_video_file:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[uploaded_file, prompt],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ClipList,
+                        ),
+                    )
+                else:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=f"{prompt}\n\nTRANSCRIPT:\n{content_source}",
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ClipList,
+                        ),
+                    )
                 
-    raise RuntimeError(f"All provided Gemini API keys hit their quota or failed. Last error: {last_error}")
+                data = json.loads(response.text)
+                return [ViralClip(**item) for item in data.get("clips", [])]
+                
+            except Exception as e:
+                last_error = e
+                error_msg = str(e).lower()
+                if "503" in error_msg or "unavailable" in error_msg or "overloaded" in error_msg or "404" in error_msg or "not_found" in error_msg:
+                    st.warning(f"⚠️ `{model_name}` is busy or unavailable. Switching to next backup model...")
+                    time.sleep(1)
+                    continue
+                elif "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
+                    st.warning(f"⚠️ Key #{key_index + 1} hit quota limit. Switching to next API key...")
+                    break
+                else:
+                    raise e
+                    
+    raise RuntimeError(f"All models and keys were busy or hit limits. Last error: {last_error}")
 
 def cut_and_format_clip(video_path: str, start: float, end: float, output_path: str, make_vertical: bool):
     with VideoFileClip(video_path) as video:
@@ -136,7 +163,7 @@ def cut_and_format_clip(video_path: str, start: float, end: float, output_path: 
             logger=None
         )
 
-# --- Sidebar Settings (Variable API Keys) ---
+# --- Sidebar Settings (Variable API Keys & Models) ---
 with st.sidebar:
     st.header("🔑 Flexible Gemini API Keys")
     st.caption("Paste one key, or multiple keys (one per line). You can change or replace them anytime without redeploying.")
@@ -145,9 +172,9 @@ with st.sidebar:
     raw_keys_input = st.text_area(
         "Enter Gemini API Key(s)",
         value=default_key,
-        height=110,
-        placeholder="AIzaSyYourFirstKey...\nAIzaSyYourBackupKey...",
-        help="Get free keys from Google AI Studio (aistudio.google.com). Keys start with AIzaSy."
+        height=100,
+        placeholder="AQ.YourFirstKey...\nAQ.YourBackupKey...",
+        help="Get free keys from Google AI Studio. Add multiple keys on separate lines for automatic failover."
     )
     
     api_keys = [k.strip() for k in raw_keys_input.splitlines() if k.strip()]
@@ -157,20 +184,29 @@ with st.sidebar:
         st.warning("⚠️ No API key entered yet.")
 
     st.markdown("---")
+    st.header("🤖 AI Model Fallback Order")
+    models_input = st.text_input(
+        "Models to try (comma-separated)",
+        value="gemini-3.8-flash-lite, gemini-3.8-flash, gemini-3.0-flash, gemini-2.5-flash-lite",
+        help="If the first model has a 503 high-demand spike, the app automatically tries the next one."
+    )
+    models_to_try = [m.strip() for m in models_input.split(",") if m.strip()]
+
+    st.markdown("---")
     st.header("🎬 Video Settings")
     make_vertical = st.toggle("Crop to 9:16 Vertical (Shorts)", value=True)
-    st.caption("Tip: If YouTube blocks cloud downloads, switch to the 'Upload MP4' tab.")
+    st.caption("Tip: If YouTube blocks cloud downloads, switch to the 'Upload Video File' tab.")
 
 # --- Main Interface ---
-tab1, tab2 = st.tabs(["🔗 Paste YouTube Link", "📁 Upload Video File (Backup)"])
+tab1, tab2 = st.tabs(["📁 Upload Video File (Recommended)", "🔗 Paste YouTube Link"])
 
 with tab1:
-    yt_url = st.text_input("YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
-    run_yt = st.button("✨ Generate Viral Clips from Link", type="primary", use_container_width=True)
-
-with tab2:
     uploaded_video = st.file_uploader("Upload an MP4 video", type=["mp4", "mov", "mkv"])
     run_upload = st.button("✨ Generate Viral Clips from File", type="primary", use_container_width=True)
+
+with tab2:
+    yt_url = st.text_input("YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
+    run_yt = st.button("✨ Generate Viral Clips from Link", type="primary", use_container_width=True)
 
 # --- Processing Logic ---
 if run_yt or run_upload:
@@ -200,7 +236,7 @@ if run_yt or run_upload:
                     status.update(label="Download complete!", state="complete")
 
                 with st.status("Step 2/3: AI is hunting for viral moments...", expanded=True) as status:
-                    clips = analyze_with_gemini_rotation(api_keys, transcript_text, is_video_file=False)
+                    clips = analyze_with_gemini_rotation(api_keys, models_to_try, transcript_text, is_video_file=False)
                     status.update(label=f"Found {len(clips)} viral segments!", state="complete")
 
             elif run_upload:
@@ -211,8 +247,8 @@ if run_yt or run_upload:
                 with open(raw_video_path, "wb") as f:
                     f.write(uploaded_video.read())
 
-                with st.status("Step 1/2: Uploading video to Gemini AI for analysis...", expanded=True) as status:
-                    clips = analyze_with_gemini_rotation(api_keys, raw_video_path, is_video_file=True)
+                with st.status("Step 1/2: Uploading & analyzing video with Gemini AI...", expanded=True) as status:
+                    clips = analyze_with_gemini_rotation(api_keys, models_to_try, raw_video_path, is_video_file=True)
                     status.update(label=f"Found {len(clips)} viral segments!", state="complete")
 
             if not clips:
@@ -242,5 +278,5 @@ if run_yt or run_upload:
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
-            if "Sign in to confirm" in str(e) or "403" in str(e):
-                st.info("💡 YouTube blocked the cloud server IP. Download the video on your device and use the **Upload Video File (Backup)** tab!")
+            if "Sign in to confirm" in str(e) or "403" in str(e) or "blocking requests" in str(e).lower():
+                st.info("💡 YouTube blocked the cloud server IP. Use the **Upload Video File (Recommended)** tab instead!")
